@@ -1,0 +1,1053 @@
+<!doctype html>
+
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pitch helix</title>
+</head>
+
+<body>
+<div id="container"></div>
+<script type="importmap">
+  {
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.181.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.181.1/examples/jsm/"
+  }
+}
+</script>
+<noscript>
+  <!-- Optional, place it wherever it makes sense -->
+  JavaScript is not enabled.
+</noscript>
+<script>
+  
+import * as THREE from 'three';
+
+const SAMPLE_URL = '';
+
+/* -------------------- State -------------------- */
+let renderer, scene, camera;
+let pointsMesh;
+let spineLine = null;
+let analyser, audioCtx, sourceNode;
+let dataArray;
+let freqCount;
+let running = true;
+let animationId;
+let container;
+let wakeLock = null;
+
+const FFT_SIZE = 8192;
+const MIN_FREQ = 50;
+const MAX_FREQ = 3000;
+const OCTAVE_SPACING = 0.5;
+const BASE_RADIUS = 1.5;
+const POINT_BASE_SIZE = 3.6;
+const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+const BINS_PER_OCTAVE = 192;
+const POINT_BLUR_FACTOR = 0.1;
+
+let MAX_SPIRAL_RADIUS = 6.0;
+let cachedFileURL = null;
+
+/* -------------------- Noise floor + perceptual mapping globals -------------------- */
+// Add these near other top-level state variables
+let globalNoiseFloor = 0.012;        // running estimate of audible noise floor (0..1)
+const NOISE_FLOOR_ATTACK = 0.04;     // how quickly floor rises toward recent energy
+const NOISE_FLOOR_DECAY = 0.003;     // how slowly floor falls when things quiet down
+const MIN_VISUAL_THRESHOLD = 0.007;  // absolute lower cutoff below which we force zero
+const COLOR_GAMMA = 1.8;             // compress low energies more for colors
+const SIZE_GAMMA = 1.1;              // slight shaping for size
+
+/* -------------------- Public API -------------------- */
+export function start() {
+  if (!renderer) init();
+}
+export function stop() {
+  if (animationId) cancelAnimationFrame(animationId);
+  running = false;
+}
+export function resumeAudioContext() {
+  if (audioCtx) audioCtx.resume();
+}
+export function useMicrophone() {
+  return enableMic();
+}
+
+/* -------------------- Initialization -------------------- */
+async function init(opts = {}) {
+  container = document.getElementById(opts.containerId || 'container') || document.body;
+  applyContainerStyles(container);
+  applyBodyStyles();
+
+  createRenderer();
+  createSceneAndCamera();
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+  const savedAudio = await loadAudioFromDB();
+
+  if (savedAudio) {
+    console.log("Loaded cached audio from IndexedDB.");
+    cachedFileURL = URL.createObjectURL(new Blob([savedAudio]));
+    await setupAudio(cachedFileURL);
+  } else {
+    console.log("No cached audio; falling back to sample.");
+    await setupAudio(SAMPLE_URL).catch(() => { /* ignore if URL empty */ });
+  }
+
+  createPitchSpiralPoints();
+
+  addPitchGuides();
+
+  window.addEventListener('resize', onWindowResize);
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+  });
+
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible') {
+      await requestWakeLock();
+    } else {
+      releaseWakeLock();
+    }
+  });
+
+  addControls();
+  await requestWakeLock().catch(() => { /* non-fatal */ });
+
+  animate();
+}
+
+/* -------------------- DOM / Renderer helpers -------------------- */
+function applyContainerStyles(el) {
+  el.style.position = el.style.position || 'fixed';
+  el.style.left = '0';
+  el.style.top = '0';
+  el.style.right = '0';
+  el.style.bottom = '0';
+  el.style.overflow = 'hidden';
+  el.style.touchAction = 'none';
+}
+function applyBodyStyles() {
+  if (document && document.body) {
+    document.body.style.margin = '0';
+    document.body.style.padding = '0';
+    document.body.style.background = '#05050a';
+  }
+}
+function createRenderer() {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.domElement.style.width = '100%';
+  renderer.domElement.style.height = '100%';
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
+  // This should use logical pixels
+  //renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setClearColor(0x05050a, 1);
+  container.appendChild(renderer.domElement);
+}
+function createSceneAndCamera() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(45, (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight), 0.1, 2000);
+  camera.position.set(0, 0, 10);
+  camera.lookAt(0, 0, 0);
+  scene.add(camera);
+}
+
+/* -------------------- Audio setup -------------------- */
+async function setupAudio(url) {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  analyser.smoothingTimeConstant = 0.8;
+
+  freqCount = analyser.frequencyBinCount;
+  dataArray = new Uint8Array(freqCount);
+
+  if (!url) {
+    // no URL provided; don't create audio element
+    return;
+  }
+
+  const audio = createAudioElement(url);
+  document.body.appendChild(audio);
+  audio.style.display = 'none';
+
+  await audio.play().catch((err) => {
+    console.warn('Autoplay prevented; user interaction required to start audio.', err);
+  });
+
+  sourceNode = audioCtx.createMediaElementSource(audio);
+  sourceNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  window.__visualizer_audio_element = audio;
+}
+function createAudioElement(url) {
+  const audio = document.createElement('audio');
+  audio.crossOrigin = 'anonymous';
+  audio.src = url;
+  audio.controls = false;
+  audio.loop = true;
+  return audio;
+}
+
+/* -------------------- Microphone support -------------------- */
+async function enableMic() {
+  // stop existing audio playback element if present
+  try {
+    const audioEl = window.__visualizer_audio_element;
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.src = '';
+      if (audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+      window.__visualizer_audio_element = null;
+    }
+  } catch (e) { /* ignore */ }
+
+  try {
+    if (sourceNode && sourceNode.mediaStream) {
+      sourceNode.mediaStream.getTracks().forEach(t => t.stop());
+    }
+  } catch (e) { /* ignore */ }
+
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  const constraints = {
+    audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    },
+    video: false
+  };
+
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  const micSource = audioCtx.createMediaStreamSource(stream);
+
+  // IMPORTANT: do NOT create a monitor gain or connect to audioCtx.destination.
+  // This ensures the microphone is analyzed but NOT audibly played back.
+  try { if (analyser) analyser.disconnect(); } catch (e) {}
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  analyser.smoothingTimeConstant = 0.85;
+
+  // connect mic -> analyser, but do NOT connect analyser to destination
+  micSource.connect(analyser);
+
+  // keep sourceNode reference for future stream stop/cleanup
+  sourceNode = micSource;
+
+  freqCount = analyser.frequencyBinCount;
+  dataArray = new Uint8Array(freqCount);
+}
+
+/* -------------------- Pitch spiral construction -------------------- */
+function createPitchSpiralPoints() {
+  const sr = (audioCtx && audioCtx.sampleRate) ? audioCtx.sampleRate : 44100;
+  const fftSize = FFT_SIZE;
+
+  const minMidi = 69 + 12 * (Math.log(MIN_FREQ / 440) / Math.log(2));
+  const maxMidi = 69 + 12 * (Math.log(MAX_FREQ / 440) / Math.log(2));
+
+  const stepMidi = 12 / BINS_PER_OCTAVE;
+  const N = Math.max(8, Math.ceil((maxMidi - minMidi) / stepMidi));
+
+  const { positions, colors, sizes, alphas, bins, maxRadius } = buildSpiralArrays(N, minMidi, stepMidi, sr, fftSize);
+
+  MAX_SPIRAL_RADIUS = Math.max(maxRadius, 3.0);
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+  geometry.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+  geometry.userData.bins = bins;
+
+  const material = createPointMaterial(POINT_BLUR_FACTOR);
+
+  if (pointsMesh) {
+    scene.remove(pointsMesh);
+    pointsMesh.geometry.dispose();
+    pointsMesh.material.dispose();
+  }
+
+  pointsMesh = new THREE.Points(geometry, material);
+  pointsMesh.renderOrder = 2;
+  scene.add(pointsMesh);
+
+  safeAddBaseRing(BASE_RADIUS);
+  createOrUpdateSpineFromGeometry(geometry);
+  fitCameraToSpiral(MAX_SPIRAL_RADIUS);
+}
+function buildSpiralArrays(N, minMidi, stepMidi, sampleRate, fftSize) {
+  const positions = new Float32Array(N * 3);
+  const colors = new Float32Array(N * 3);
+  const sizes = new Float32Array(N);
+  const alphas = new Float32Array(N);
+  const bins = [];
+
+  let p = 0;
+  let maxRadius = 0;
+  for (let i = 0; i < N; i++) {
+    const midi = minMidi + i * stepMidi;
+    const freq = 440 * Math.pow(2, (midi - 69) / 12);
+
+    if (freq < MIN_FREQ || freq > MAX_FREQ || !isFinite(freq)) {
+      positions[p * 3 + 0] = 0;
+      positions[p * 3 + 1] = -9999;
+      positions[p * 3 + 2] = 0;
+      colors[p * 3 + 0] = colors[p * 3 + 1] = colors[p * 3 + 2] = 0;
+      sizes[p] = 0.0;
+      alphas[p] = 0.0;
+      bins.push({ valid: false });
+      p++;
+      continue;
+    }
+
+    let pitchClass = midi % 12;
+    if (pitchClass < 0) pitchClass += 12;
+    const angle = (pitchClass / 12) * Math.PI * 2;
+
+    const octavesFromMin = (midi - minMidi) / 12.0;
+    const radius = BASE_RADIUS + octavesFromMin * OCTAVE_SPACING;
+
+    if (radius > maxRadius) maxRadius = radius;
+
+    const x = radius * Math.cos(angle);
+    const y = radius * Math.sin(angle);
+
+    positions[p * 3 + 0] = x;
+    positions[p * 3 + 1] = y;
+    positions[p * 3 + 2] = 0;
+
+    colors[p * 3 + 0] = 0.0;
+    colors[p * 3 + 1] = 0.0;
+    colors[p * 3 + 2] = 0.0;
+
+    sizes[p] = 0.0;
+    alphas[p] = 0.0;
+
+    const binIndexFloat = (freq * fftSize) / sampleRate;
+    bins.push({ valid: true, midi, freq, angle, radius, binIndexFloat });
+
+    p++;
+  }
+
+  return { positions, colors, sizes, alphas, bins, maxRadius };
+}
+function createPointMaterial(blurFactor) {
+  const vertexShader = `
+    attribute float size;
+    attribute float alpha;
+    attribute vec3 aColor;
+    uniform float uViewportHeight; // <-- ADDED
+    varying vec3 vColor;
+    varying float vAlpha;
+    void main() {
+      vColor = aColor;
+      vAlpha = alpha;
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      // float perspectiveScale = 400.0 / -mvPosition.z; // <-- OLD
+      float perspectiveScale = (uViewportHeight * 0.5) / -mvPosition.z; // <-- CHANGED
+      float pointSize = size * perspectiveScale;
+      gl_PointSize = clamp(pointSize, 0.0, 140.0);
+      gl_Position = projectionMatrix * mvPosition;
+    }
+  `;
+  const fragmentShader = `
+    uniform float uPointBlur;
+    varying vec3 vColor;
+    varying float vAlpha;
+    void main() {
+      vec2 coord = gl_PointCoord - 0.5;
+      float dist2 = dot(coord, coord);
+      float shapeAlpha = 1.0 - smoothstep(0.0, uPointBlur, dist2);
+      float alpha = shapeAlpha * vAlpha;
+      if (alpha <= 0.001) discard;
+      vec3 color = pow(vColor, vec3(1.0 / 2.2));
+      gl_FragColor = vec4(color, alpha);
+    }
+  `;
+  const h = container.clientHeight || window.innerHeight || 600;
+  const dpr = window.devicePixelRatio || 1; // <-- GET PIXEL RATIO
+
+  return new THREE.ShaderMaterial({
+    vertexShader,
+    fragmentShader,
+    uniforms: {
+      uPointBlur: { value: blurFactor },
+      // Pass the PHYSICAL height to the shader
+      uViewportHeight: { value: h * dpr } // <-- MULTIPLY BY DPR
+    },
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+    vertexColors: true,
+  });
+}
+
+function safeAddBaseRing(radius) {
+  try {
+    const ringRadius = radius;
+    const guideGeom = new THREE.RingGeometry(ringRadius - 0.02, ringRadius + 0.02, 64);
+    const guideMat = new THREE.MeshBasicMaterial({ color: 0x222233, side: THREE.DoubleSide });
+    const ring = new THREE.Mesh(guideGeom, guideMat);
+    ring.rotation.x = Math.PI;
+    scene.add(ring);
+  } catch (e) {
+    // ignore ring creation errors on some platforms
+  }
+}
+
+/* -------------------- Spine (centerline) -------------------- */
+function createOrUpdateSpineFromGeometry(pointsGeometry) {
+  const posAttr = pointsGeometry.getAttribute('position');
+  const N = posAttr.count;
+  const spinePoints = [];
+  for (let i = 0; i < N; i++) {
+    const x = posAttr.array[i * 3 + 0];
+    const y = posAttr.array[i * 3 + 1];
+    const z = posAttr.array[i * 3 + 2];
+    if (y <= -9000) continue;
+    spinePoints.push(new THREE.Vector3(x, y, -0.02));
+  }
+
+  if (spineLine) {
+    scene.remove(spineLine);
+    if (spineLine.geometry) spineLine.geometry.dispose();
+    if (spineLine.material) spineLine.material.dispose();
+    spineLine = null;
+  }
+
+  if (spinePoints.length < 2) return;
+
+  const spineGeom = new THREE.BufferGeometry().setFromPoints(spinePoints);
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xb9c0d6,
+    transparent: true,
+    opacity: 0.10,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  spineLine = new THREE.Line(spineGeom, mat);
+  spineLine.renderOrder = 1;
+  scene.add(spineLine);
+}
+
+/* -------------------- Per-frame update -------------------- */
+function updateFromAnalyser() {
+  if (!analyser || !pointsMesh) return;
+
+  analyser.getByteFrequencyData(dataArray);
+
+  // compute an overall energy to update the noise floor
+  // compute RMS energy instead of plain mean – less sensitive to a few loud bins
+  let sumSq = 0;
+  for (let i = 0; i < dataArray.length; i++) {
+    const v = dataArray[i] / 255.0;
+    sumSq += v * v;
+  }
+  const overallRms = Math.sqrt(sumSq / dataArray.length);
+  const overallAvg = overallRms; // use RMS for noise floor tracking
+
+  // update noise floor with asymmetric attack/decay so it follows slow ambient but ignores transients
+  if (overallAvg > globalNoiseFloor) {
+    globalNoiseFloor = lerp(globalNoiseFloor, overallAvg, NOISE_FLOOR_ATTACK);
+  } else {
+    globalNoiseFloor = lerp(globalNoiseFloor, overallAvg, NOISE_FLOOR_DECAY);
+  }
+  // clamp sensible range
+  globalNoiseFloor = clamp(globalNoiseFloor, 0.0005, 0.3);
+
+  const geometry = pointsMesh.geometry;
+  const colors = geometry.getAttribute('aColor').array;
+  const sizes = geometry.getAttribute('size').array;
+  const alphas = geometry.getAttribute('alpha').array;
+  const bins = geometry.userData.bins;
+  const N = bins.length;
+  const sr = (audioCtx && audioCtx.sampleRate) ? audioCtx.sampleRate : 44100;
+  const fftSize = FFT_SIZE;
+  const maxBinIndex = dataArray.length - 1;
+
+  for (let i = 0; i < N; i++) {
+    const b = bins[i];
+    if (!b.valid) {
+      colors[i * 3 + 0] = 0.0;
+      colors[i * 3 + 1] = 0.0;
+      colors[i * 3 + 2] = 0.0;
+      sizes[i] = 0.0;
+      alphas[i] = 0.0;
+      continue;
+    }
+
+    const magnitude = sampleMagnitudeForBin(b.freq, fftSize, sr, maxBinIndex); // raw 0..1
+
+    // apply boosting (frequency compensation)
+    const boosted = computeBoostedMagnitude(magnitude, b.freq); // may be >1 but bounded
+
+    // treat tiny boosted values as zero (avoid tiny boosts becoming visible)
+    if (boosted < MIN_VISUAL_THRESHOLD) {
+      sizes[i] = 0.0;
+      alphas[i] = 0.0;
+      colors[i * 3 + 0] = colors[i * 3 + 1] = colors[i * 3 + 2] = 0.0;
+      continue;
+    }
+
+    // subtract noise floor and normalize to [0,1]
+    // NOTE: globalNoiseFloor is in linear 0..1 domain derived from overallAvg;
+    // use the boosted signal for normalization so the floor refers to perceived energy.
+    let norm = (boosted - globalNoiseFloor) / Math.max(1e-6, (1.0 - globalNoiseFloor));
+    norm = clamp(norm, 0.0, 1.0);
+
+    // derive visual attributes from normalized perceptual value
+    sizes[i] = computePointSizeFromNormalized(norm, b.radius);
+    alphas[i] = computeAlphaFromNormalized(norm);
+
+    const colorRGB = magnitudeToDistinctColor(norm);
+    colors[i * 3 + 0] = colorRGB[0];
+    colors[i * 3 + 1] = colorRGB[1];
+    colors[i * 3 + 2] = colorRGB[2];
+  }
+
+  geometry.getAttribute('aColor').needsUpdate = true;
+  geometry.getAttribute('size').needsUpdate = true;
+  geometry.getAttribute('alpha').needsUpdate = true;
+}
+
+function computePointSizeFromNormalized(norm, radius) {
+  // radius reduces size slightly for outer octaves so center feels stronger
+  const radialFactor = 1.0 / Math.sqrt(1.0 + radius);
+  const sizeScale = Math.pow(norm, SIZE_GAMMA);
+  let computedSize = POINT_BASE_SIZE * sizeScale * (0.52 + 0.48 * radialFactor);
+  // ensure a crisp minimum so tiny normalized values don't still paint big dots
+  if (norm <= 0.015) computedSize = 0.0;
+  if (computedSize < 0.001) computedSize = 0.0;
+  return computedSize;
+}
+
+function sampleMagnitudeForBin(freq, fftSize, sampleRate, maxBinIndex) {
+  const idxFloat = (freq * fftSize) / sampleRate;
+  const idx = Math.max(0, Math.min(maxBinIndex, idxFloat));
+  const i0 = Math.floor(idx);
+  const i1 = Math.min(maxBinIndex, i0 + 1);
+  const t = idx - i0;
+  const mag0 = dataArray[i0] / 255;
+  const mag1 = dataArray[i1] / 255;
+  return mag0 * (1 - t) + mag1 * t;
+}
+
+function computeBoostedMagnitude(magnitude, freq) {
+  // Conservative frequency compensation:
+  // - low frequencies get a mild boost, high ones get mild cut.
+  // - keep factor in reasonable range to avoid huge amplification.
+  // freqComp chosen empirically; tweak min/max and exponent as desired.
+  const f = Math.max(20, freq); // avoid log of tiny numbers
+  // map freq to a factor in ~[0.6, 1.6] (you can tighten to [0.8,1.4])
+  const freqLog = Math.log10(f);
+  // baseline mapping: higher freq -> slightly less boost
+  let freqComp = Math.pow(10, (2.6 - freqLog) * 0.06); // gently decreasing with freq
+  freqComp = clamp(freqComp, 0.6, 1.6);
+
+  const gain = 1.05; // modest global gain
+  // multiply (not divide) to keep scaling monotonic and stable
+  const scaled = magnitude * gain * freqComp;
+
+  // light compression — exponent < 1 compresses peaks slightly
+  const comp = Math.pow(Math.max(0, scaled), 0.92);
+
+  // allow values slightly above 1.0 (so normalization still has headroom)
+  return Math.min(2.0, comp);
+}
+
+
+function computePointSize(magnitude, boosted, radius) {
+  const sizeScale = Math.pow(boosted, 0.9);
+  const radialFactor = 1.0 / Math.sqrt(1.0 + radius);
+  let computedSize = POINT_BASE_SIZE * sizeScale * (0.55 + 0.45 * radialFactor);
+  if (magnitude < 0.02) computedSize = 0.35;
+  if (magnitude < 0.005) computedSize = 0.0;
+  return computedSize;
+}
+
+function computeAlphaFromNormalized(norm) {
+  // stronger curve: low values rapidly fall to near-zero alpha
+  let a = Math.pow(norm, 1.9) * 1.25;
+  a = clamp(a, 0.0, 1.0);
+  if (norm < 0.02) a *= (norm / 0.02); // extra squelch below threshold
+  return a;
+}
+
+/* -------------------- Color mapping -------------------- */
+/*
+New color map:
+- Uses a multi-stop gradient to ensure low/medium/high are visually distinct.
+Stops (t):
+0.0 -> darkGray (very quiet)
+0.12 -> deepBlue
+0.35 -> cyan
+0.65 -> yellow
+1.0 -> red (very loud)
+*/
+function magnitudeToDistinctColor(t) {
+  // t in [0,1] is already noise-floor-subtracted / normalized
+  const tt = clamp(t, 0, 1);
+  // apply a gamma to compress the low-mid range and emphasize differences at medium/high
+  const g = Math.pow(tt, COLOR_GAMMA);
+
+  const stops = [
+    { t: 0.0, c: [0.08, 0.08, 0.08] },   // darker dark gray for true quiet
+    { t: 0.12, c: [0.03, 0.10, 0.42] },  // deep blue
+    { t: 0.35, c: [0.06, 0.70, 0.85] },  // cyan / aqua
+    { t: 0.65, c: [0.95, 0.82, 0.10] },  // yellow
+    { t: 1.0, c: [0.92, 0.35, 0.18] }    // warm red/orange
+  ];
+
+  // map g through stops by scaling g to stop domain
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i];
+    const b = stops[i + 1];
+    // remap g onto global 0..1 then test where it falls relative to the defined stop positions
+    if (g >= a.t && g <= b.t) {
+      const local = (g - a.t) / (b.t - a.t);
+      // very low values should remain almost dark gray regardless of slight floor noise
+      if (g < 0.02) return [0.08, 0.08, 0.08];
+      return [
+        lerp(a.c[0], b.c[0], local),
+        lerp(a.c[1], b.c[1], local),
+        lerp(a.c[2], b.c[2], local)
+      ];
+    }
+  }
+  return stops[stops.length - 1].c;
+}
+
+/* -------------------- Pitch guides and labels -------------------- */
+let pitchGuidesGroup = null;
+function addPitchGuides() {
+  if (pitchGuidesGroup) {
+    scene.remove(pitchGuidesGroup);
+    pitchGuidesGroup.traverse(child => {
+      if (child.material) child.material.dispose?.();
+      if (child.geometry) child.geometry.dispose?.();
+      if (child.map) child.map.dispose?.();
+    });
+    pitchGuidesGroup = null;
+  }
+
+  const guides = new THREE.Group();
+
+  const screenH = Math.max(320, window.innerHeight || 600);
+  const LABEL_MIN = 22;
+  const LABEL_MAX = 58;
+  const t = Math.min(1, (screenH - 320) / (1400 - 320));
+  const targetLabelPixels = LABEL_MIN + (LABEL_MAX - LABEL_MIN) * t;
+
+  const labelWorldH = pixelsToWorldSize(targetLabelPixels, camera.position.z);
+  const labelAspect = 128 / 64;
+  const labelWorldW = labelWorldH * labelAspect;
+  const labelGap = Math.max(pixelsToWorldSize(3, camera.position.z), labelWorldW * 0.12);
+  const outerLen = MAX_SPIRAL_RADIUS + labelGap;
+
+  for (let i = 0; i < 12; i++) {
+    const angle = (i / 12) * Math.PI * 2;
+    const x = Math.cos(angle) * outerLen;
+    const y = Math.sin(angle) * outerLen;
+    const geom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(x, y, 0)]);
+    const mat = new THREE.LineBasicMaterial({ color: 0x202030, linewidth: 1 });
+    const line = new THREE.Line(geom, mat);
+    guides.add(line);
+
+    const { canvas, ctx, fontPx } = createLabelCanvas(NOTE_NAMES[i], targetLabelPixels);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+
+    const spriteMat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(spriteMat);
+
+    const spriteOffset = Math.max(labelWorldW * 0.06, pixelsToWorldSize(2, camera.position.z));
+    sprite.position.set(Math.cos(angle) * (outerLen + spriteOffset), Math.sin(angle) * (outerLen + spriteOffset), 0);
+
+    sprite.scale.set(labelWorldW, labelWorldH, 1);
+    sprite.renderOrder = 1.5;
+    guides.add(sprite);
+  }
+
+  pitchGuidesGroup = guides;
+  scene.add(guides);
+
+  const extraWorldPadding = Math.min(labelWorldW + pixelsToWorldSize(6, camera.position.z), pixelsToWorldSize(44, camera.position.z));
+  fitCameraToSpiral(MAX_SPIRAL_RADIUS + extraWorldPadding);
+}
+function createLabelCanvas(text, targetLabelPixels) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const fontPx = Math.round(Math.max(12, targetLabelPixels * 0.64));
+  ctx.font = `${fontPx}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(200,200,220,0.95)';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2 + fontPx / 3);
+  return { canvas, ctx, fontPx };
+}
+
+/* -------------------- Animation loop -------------------- */
+function animate() {
+  animationId = requestAnimationFrame(animate);
+  scene.rotation.z += 0.0007;
+  if (analyser && running) {
+    updateFromAnalyser();
+  }
+  renderer.render(scene, camera);
+}
+
+/* -------------------- Utilities -------------------- */
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// HSL -> RGB was retained as helper (left in case external use)
+function hslToRgb(h, s, l) {
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const hk = h;
+  const tc = [hk + 1 / 3, hk, hk - 1 / 3];
+  const col = tc.map(t => {
+    let tt = t;
+    if (tt < 0) tt += 1;
+    if (tt > 1) tt -= 1;
+    if (tt < 1 / 6) return p + (q - p) * 6 * tt;
+    if (tt < 1 / 2) return q;
+    if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
+    return p;
+  });
+  return col;
+}
+
+/* -------------------- Camera fitting -------------------- */
+function computeCameraDistanceForRadius(radius, fovDeg, aspect, margin = 1.1) {
+  const fov = (fovDeg * Math.PI) / 180;
+  const halfFovY = fov / 2;
+  const distY = Math.abs(radius) / Math.tan(halfFovY);
+  const halfFovX = Math.atan(Math.tan(halfFovY) * aspect);
+  const distX = Math.abs(radius) / Math.tan(halfFovX);
+  return Math.max(distX, distY) * margin;
+}
+
+function fitCameraToSpiral(radius, extraPaddingWorld = 0) {
+  const w = container.clientWidth || window.innerWidth;
+  const h = container.clientHeight || window.innerHeight;
+  const aspect = w / h;
+  const TIGHT_MARGIN = 1.005;   // very small padding
+  const requiredZ = computeCameraDistanceForRadius(
+      radius + extraPaddingWorld,   // remove +1.02 offset
+      camera.fov,
+      aspect,
+      TIGHT_MARGIN
+  );
+  camera.position.set(0, 0, requiredZ);
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+  if (spineLine) spineLine.renderOrder = 1;
+  if (pointsMesh) pointsMesh.renderOrder = 2;
+}
+
+function onWindowResize() {
+  const w = container.clientWidth || window.innerWidth;
+  const h = container.clientHeight || window.innerHeight;
+  const dpr = window.devicePixelRatio || 1; // <-- GET PIXEL RATIO
+
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+
+  // Tell renderer to use the DPR, but set size in logical pixels
+  renderer.setPixelRatio(dpr); // <-- ADD THIS
+  renderer.setSize(w, h);
+
+  if (pointsMesh) {
+    // Update the uniform with the PHYSICAL height
+    pointsMesh.material.uniforms.uViewportHeight.value = h * dpr; // <-- MULTIPLY BY DPR
+  }
+
+  fitCameraToSpiral(MAX_SPIRAL_RADIUS);
+  addPitchGuides();
+}
+
+/* -------------------- Fullscreen -------------------- */
+async function toggleFullscreen() {
+  const el = container || document.documentElement;
+  if (!document.fullscreenElement) {
+    try {
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
+      } else if (el.webkitRequestFullscreen) {
+        el.webkitRequestFullscreen();
+      }
+    } catch (err) {
+      console.warn('Failed to enter fullscreen:', err);
+    }
+  } else {
+    try {
+      if (document.exitFullscreen) {
+        await document.exitFullscreen();
+      } else if (document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+      }
+    } catch (err) {
+      console.warn('Failed to exit fullscreen:', err);
+    }
+  }
+}
+
+/* -------------------- Wake lock -------------------- */
+async function requestWakeLock() {
+  if ('wakeLock' in navigator) {
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log('Wake lock acquired.');
+      wakeLock.addEventListener('release', () => {
+        console.log('Wake lock released.');
+        wakeLock = null;
+      });
+    } catch (err) {
+      console.warn('Wake lock request failed:', err);
+      wakeLock = null;
+    }
+  } else {
+    console.log('Wake Lock API not supported by this browser.');
+  }
+}
+function releaseWakeLock() {
+  try {
+    if (wakeLock && wakeLock.release) {
+      wakeLock.release();
+      wakeLock = null;
+    }
+  } catch (e) {
+    console.warn('Error releasing wake lock', e);
+  }
+}
+
+/* -------------------- Controls -------------------- */
+function addControls() {
+  const ctrl = document.createElement('div');
+  ctrl.style.position = 'fixed';
+  ctrl.style.right = '12px';
+  ctrl.style.top = '12px';
+  ctrl.style.display = 'flex';
+  ctrl.style.flexDirection = 'column';
+  ctrl.style.gap = '8px';
+  ctrl.style.zIndex = 9999;
+  ctrl.style.pointerEvents = 'auto';
+  document.body.appendChild(ctrl);
+
+  const btnStyle = 'padding:8px 12px;background:#111; color:#ddd; border-radius:6px; border:1px solid #333; cursor:pointer; font-family:sans-serif;';
+
+  // Hidden file input used only if SAMPLE_URL is empty (fallback to pick a local sample)
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = 'audio/*';
+  fileInput.style.display = 'none';
+  document.body.appendChild(fileInput);
+
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    const arrayBuffer = await file.arrayBuffer();
+    // optional: cache to IndexedDB
+    await saveAudioToDB(arrayBuffer).catch(() => {});
+    if (cachedFileURL) URL.revokeObjectURL(cachedFileURL);
+    cachedFileURL = URL.createObjectURL(new Blob([arrayBuffer]));
+    await setupAudio(cachedFileURL);
+  };
+
+  // Load Sample button (uses SAMPLE_URL if provided; otherwise opens file picker)
+  const loadBtn = document.createElement('button');
+  loadBtn.innerText = 'Load Sample';
+  loadBtn.style.cssText = btnStyle;
+  loadBtn.onclick = async () => {
+    if (SAMPLE_URL && SAMPLE_URL.length > 0) {
+      // if there's already an audio element, stop and replace it
+      try {
+        const audioEl = window.__visualizer_audio_element;
+        if (audioEl) {
+          audioEl.pause();
+          audioEl.src = '';
+          if (audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+          window.__visualizer_audio_element = null;
+        }
+      } catch (e) { /* ignore */ }
+      await setupAudio(SAMPLE_URL).catch((e) => {
+        console.warn('Failed to load SAMPLE_URL:', e);
+      });
+    } else {
+      // fallback to letting the user pick a local file
+      fileInput.click();
+    }
+  };
+  ctrl.appendChild(loadBtn);
+
+  // Play / Pause toggle for the sample audio element
+  const playPauseBtn = document.createElement('button');
+  playPauseBtn.innerText = 'Play Sample';
+  playPauseBtn.style.cssText = btnStyle;
+  let isPlaying = false;
+  playPauseBtn.onclick = async () => {
+    const audioEl = window.__visualizer_audio_element;
+    if (!audioEl) {
+      // try to load sample automatically if none present
+      if (SAMPLE_URL && SAMPLE_URL.length > 0) {
+        await setupAudio(SAMPLE_URL).catch(() => {});
+      } else {
+        // fallback to file picker
+        fileInput.click();
+        return;
+      }
+    }
+    const el = window.__visualizer_audio_element;
+    if (!el) return;
+    try {
+      if (!isPlaying) {
+        if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+        await el.play();
+        playPauseBtn.innerText = 'Pause Sample';
+        isPlaying = true;
+        running = true;
+      } else {
+        el.pause();
+        playPauseBtn.innerText = 'Play Sample';
+        isPlaying = false;
+        // keep visualizer running if desired; user might want to pause visual updates too:
+        // here we preserve previous behavior: pausing audio pauses the visualization.
+        running = false;
+      }
+    } catch (e) {
+      console.warn('Play/Pause failed:', e);
+    }
+  };
+  ctrl.appendChild(playPauseBtn);
+
+  // Microphone mode (analyze only; no playback)
+  const micBtn = document.createElement('button');
+  micBtn.innerText = 'Use Microphone';
+  micBtn.style.cssText = btnStyle;
+  micBtn.onclick = async () => {
+    try {
+      await enableMic();
+      if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+      // when switching to mic mode, ensure sample audio element is removed
+      try {
+        const audioEl = window.__visualizer_audio_element;
+        if (audioEl) {
+          audioEl.pause();
+          audioEl.src = '';
+          if (audioEl.parentNode) audioEl.parentNode.removeChild(audioEl);
+          window.__visualizer_audio_element = null;
+        }
+      } catch (e) { /* ignore */ }
+      // keep play/pause button state consistent
+      playPauseBtn.innerText = 'Play Sample';
+      isPlaying = false;
+      running = true;
+    } catch (e) {
+      alert('Microphone access denied or not available.');
+      console.error(e);
+    }
+  };
+  ctrl.appendChild(micBtn);
+
+  // Fullscreen toggle
+  const fsBtn = document.createElement('button');
+  fsBtn.innerText = 'Toggle Fullscreen (F)';
+  fsBtn.style.cssText = btnStyle;
+  fsBtn.onclick = () => {
+    toggleFullscreen();
+  };
+  ctrl.appendChild(fsBtn);
+}
+
+
+/* -------------------- IndexedDB helpers -------------------- */
+const DB_NAME = "pitchHelixAudioDB";
+const STORE_NAME = "audioFiles";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(STORE_NAME);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function saveAudioToDB(arrayBuffer) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(arrayBuffer, "cachedAudio");
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function loadAudioFromDB() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const request = tx.objectStore(STORE_NAME).get("cachedAudio");
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+async function clearAudioDB() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).delete("cachedAudio");
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* -------------------- Misc -------------------- */
+function pixelsToWorldSize(pixels, camZ = camera.position.z) {
+  const canvasH = (renderer && renderer.domElement && renderer.domElement.clientHeight) || window.innerHeight || 800;
+  const fov = (camera.fov * Math.PI) / 180;
+  const worldHeight = 2 * Math.tan(fov / 2) * Math.abs(camZ);
+  return (pixels / canvasH) * worldHeight;
+}
+
+/* -------------------- Magnitude gradient helpers (kept at end) -------------------- */
+/* The module auto-starts when loaded in a browser-like document environment */
+if (typeof document !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', () => {
+    if (!document.getElementById('container')) {
+      const c = document.createElement('div');
+      c.id = 'container';
+      c.style.position = 'fixed';
+      c.style.left = '0';
+      c.style.top = '0';
+      c.style.right = '0';
+      c.style.bottom = '0';
+      c.style.overflow = 'hidden';
+      document.body.appendChild(c);
+    }
+    init({ containerId: 'container' });
+  }, { once: true });
+}
+
+</script>
+</body>
+</html>
